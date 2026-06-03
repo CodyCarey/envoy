@@ -52,6 +52,8 @@ public:
   const absl::string_view ng_http2_err_unknown_ = "http2.unknown.nghttp2.error";
   // The number of headers (or trailers) exceeded the configured limits
   const absl::string_view too_many_headers = "http2.too_many_headers";
+  // The total size of headers exceeded the configured limits
+  const absl::string_view header_list_size_too_large = "http2.header_list_size_too_large";
   // Envoy detected an HTTP/2 frame flood from the server.
   const absl::string_view outbound_frame_flood = "http2.outbound_frames_flood";
   // Envoy detected an inbound HTTP/2 frame flood.
@@ -180,7 +182,7 @@ ConnectionImpl::StreamImpl::StreamImpl(ConnectionImpl& parent, uint32_t buffer_l
           [this]() -> void { this->pendingSendBufferLowWatermark(); },
           [this]() -> void { this->pendingSendBufferHighWatermark(); },
           []() -> void { /* TODO(adisuissa): Handle overflow watermark */ })),
-      local_end_stream_sent_(false), remote_end_stream_(false), remote_rst_(false),
+      cookie_count_(0), local_end_stream_sent_(false), remote_end_stream_(false), remote_rst_(false),
       data_deferred_(false), received_noninformational_headers_(false),
       pending_receive_buffer_high_watermark_called_(false),
       pending_send_buffer_high_watermark_called_(false), reset_due_to_messaging_error_(false),
@@ -622,7 +624,9 @@ void ConnectionImpl::StreamImpl::pendingSendBufferLowWatermark() {
 }
 
 void ConnectionImpl::StreamImpl::saveHeader(HeaderString&& name, HeaderString&& value) {
-  if (!Utility::reconstituteCrumbledCookies(name, value, cookies_)) {
+  if (Utility::reconstituteCrumbledCookies(name, value, cookies_)) {
+    cookie_count_++;
+  } else {
     headers().addViaMove(std::move(name), std::move(value));
   }
 }
@@ -1596,16 +1600,27 @@ int ConnectionImpl::saveHeader(int32_t stream_id, HeaderString&& name, HeaderStr
   }
 
   stream->saveHeader(std::move(name), std::move(value));
+  uint64_t headers_size = stream->headers().byteSize();
+  uint64_t headers_count = stream->headers().size();
 
-  if (stream->headers().byteSize() > max_headers_kb_ * 1024 ||
-      stream->headers().size() > max_headers_count_) {
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http2_include_cookies_in_limits")) {
+    headers_size += stream->cookies_.size();
+    headers_count += stream->cookie_count_;
+  }
+
+  if (headers_size > max_headers_kb_ * 1024) {
+    stream->setDetails(Http2ResponseCodeDetails::get().header_list_size_too_large);
+    stats_.header_list_size_too_large_.inc();
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+  }
+  if (headers_count > max_headers_count_) {
     stream->setDetails(Http2ResponseCodeDetails::get().too_many_headers);
     stats_.header_overflow_.inc();
     // This will cause the library to reset/close the stream.
     return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-  } else {
-    return 0;
   }
+
+  return 0;
 }
 
 Status ConnectionImpl::sendPendingFrames() {
@@ -2078,6 +2093,9 @@ ConnectionImpl::Http2Options::Http2Options(
   og_options_.max_header_field_size = max_headers_kb * 1024;
   og_options_.allow_extended_connect = http2_options.allow_connect();
   og_options_.allow_different_host_and_authority = true;
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http2_include_cookies_in_limits")) {
+    og_options_.enforce_max_header_list_bytes = true;
+  }
 
 #ifdef ENVOY_ENABLE_UHV
   // UHV - disable header validations in oghttp2
